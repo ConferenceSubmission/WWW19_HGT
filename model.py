@@ -123,25 +123,23 @@ class RAGCNConv(MessagePassing):
         res_val     = torch.zeros(data_size, self.n_heads, self.d_k).to(node_inp_i.device)
         
         for source_id in range(self.num_types):
-            sb = node_type_j == source_id
+            sb = (node_type_j == int(source_id))
             interact_sw = self.interact_sws[source_id]
-            transfer_sw = self.transfer_sws[source_id]
+            transfer_sw = self.transfer_sws[source_id] 
             for target_id in range(self.num_types):
-                tb = (node_type_i == target_id) & sb
+                tb = (node_type_i == int(target_id)) & sb
                 interact_tw = self.interact_tws[target_id]
                 for relation_id in range(self.num_relations):
-                    idx = tb & (edge_type == relation_id)
+                    idx = ((edge_type == int(relation_id)) * tb).detach()
                     if idx.sum() == 0:
                         continue
                     _node_inp_i = node_inp_i[idx]
                     _node_inp_j = self.emb(node_inp_j[idx], edge_time[idx])
-                    
                     _int_i = interact_tw(_node_inp_i).view(-1, self.n_heads, self.d_k)
                     _int_j = interact_sw(_node_inp_j).view(-1, self.n_heads, self.d_k)
-                    
                     _int_s = torch.bmm(_int_j.transpose(1,0), self.interact_rw[relation_id]).transpose(1,0)
-                    res_att[idx] = (_int_s * _int_i).sum(dim=-1) * self.relation_ws[target_id][relation_id][source_id] / self.sqrt_dk
-                    
+                    tmp = (_int_s * _int_i).sum(dim=-1) * self.relation_ws[target_id][relation_id][source_id] / self.sqrt_dk
+                    res_att[idx] = tmp
                     _tra_j = transfer_sw(_node_inp_j).view(-1, self.n_heads, self.d_k)
                     res_val[idx] = torch.bmm(_tra_j.transpose(1,0), self.transfer_rw[relation_id]).transpose(1,0)
                     
@@ -153,16 +151,16 @@ class RAGCNConv(MessagePassing):
 
     def update(self, aggr_out, node_inp, node_type):
         '''
-           x = BN[node_type](W[node_type] * GNN(x) + x)
+           x = BN[node_type](W[node_type] * GNN(x))
         '''
         res = torch.zeros(aggr_out.size(0), self.out_dim).to(node_inp.device)
         for t_id in range(self.num_types):
             aggregat_w = self.aggregat_ws[t_id]
             norm = self.norms[t_id]
-            idx = (node_type == t_id)
+            idx = (node_type == int(t_id))
             if idx.sum() == 0:
                 continue
-            res[idx] = norm(F.relu(aggregat_w(aggr_out[idx])) + node_inp[idx])
+            res[idx] = norm(F.relu(aggregat_w(aggr_out[idx])))
         out = self.drop(res)
         del res
         return out
@@ -189,3 +187,8 @@ class RelTemporalEncoding(nn.Module):
         self.lin = nn.Linear(n_hid * 2, n_hid)
     def forward(self, x, t):
         return x + self.lin(self.drop(self.emb(t)))
+    
+    
+    
+    
+    

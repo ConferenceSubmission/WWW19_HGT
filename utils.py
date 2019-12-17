@@ -135,17 +135,20 @@ def sample_subgraph(graph, time_range, sampled_depth = 2, sampled_number = 8, in
         After nodes are sampled, we construct the sampled adjacancy matrix.
     '''
     layer_data  = defaultdict( #target_type
-                        lambda: {} # {target_id + time}
+                        lambda: {} # {target_id: [ser, time]}
                     )
     budget     = defaultdict( #source_type
-                                    lambda: defaultdict(  #source_id + source_time
-                                        lambda: 0. #sampled_score
+                                    lambda: defaultdict(  #source_id
+                                        lambda: [0., 0] #[sampled_score, time]
                             ))
     new_layer_adj  = defaultdict( #target_type
                                     lambda: defaultdict(  #source_type
                                         lambda: defaultdict(  #relation_type
                                             lambda: [] #[target_id, source_id]
                                 )))
+    ban   = defaultdict( #target_type
+                        lambda: {} # {target_id}
+                    )
     '''
         For each node being sampled, we find out all its neighborhood, 
         adding the degree count of these nodes in the budget.
@@ -156,7 +159,7 @@ def sample_subgraph(graph, time_range, sampled_depth = 2, sampled_number = 8, in
         for source_type in te:
             tes = te[source_type]
             for relation_type in tes:
-                if relation_type == 'self':
+                if relation_type == 'self' or target_id not in tes[relation_type]:
                     continue
                 adl = tes[relation_type][target_id]
                 if len(adl) < sampled_number:
@@ -167,25 +170,10 @@ def sample_subgraph(graph, time_range, sampled_depth = 2, sampled_number = 8, in
                     source_time = adl[source_id]
                     if source_time == None:
                         source_time = target_time
-                    k = encode(source_id, source_time)
-                    '''
-                        If the node's time is out of range or already being sampled, skip
-                        Otherwise, accumulate the normalized degree.
-                    '''
-                    if source_time not in time_range or k in layer_data[source_type]:
+                    if source_time not in time_range or source_id in layer_data[source_type]:
                         continue
-                    budget[source_type][k] += 1. / len(sampled_ids)
-    '''
-        The encode and decode function is used to index each node
-        by its node_id and time together. So that a same node with
-        different timestamps can exist in the sampled graph.
-    '''
-    def decode(s):
-        idx = s.find('-')
-        return np.array([s[:idx], s[idx+1:]], dtype=float)
-    def encode(i, t):
-        return '%s-%s' % (i, t)
-
+                    budget[source_type][source_id][0] += 1. / len(sampled_ids)
+                    budget[source_type][source_id][1] = source_time
     '''
         If inp == None: we sample some paper as initial nodes;
         else:           we are dealing with a specific supervised task (e.g. author disambiguation),
@@ -201,7 +189,7 @@ def sample_subgraph(graph, time_range, sampled_depth = 2, sampled_number = 8, in
             First adding the sampled nodes then updating budget.
         '''
         for _id in rand_paper_ids:
-            layer_data['paper'][encode(_id, _time)] = len(layer_data['paper'])
+            layer_data['paper'][_id] = [len(layer_data['paper']), _time]
         for _id in rand_paper_ids:
             add_budget(graph.edge_list['paper'], _id, _time, layer_data, budget)
     else:
@@ -210,7 +198,7 @@ def sample_subgraph(graph, time_range, sampled_depth = 2, sampled_number = 8, in
         '''
         for _type in inp:
             for _id, _time in inp[_type]:
-                layer_data[_type][encode(_id, _time)] = len(layer_data[_type])
+                layer_data[_type][_id] = [len(layer_data[_type]), _time]
         for _type in inp:
             te = graph.edge_list[_type]
             for _id, _time in inp[_type]:
@@ -234,7 +222,7 @@ def sample_subgraph(graph, time_range, sampled_depth = 2, sampled_number = 8, in
                 '''
                     Sample based on accumulated degree
                 '''
-                score = np.array(list(budget[source_type].values())) ** 2
+                score = np.array(list(budget[source_type].values()))[:,0] ** 2
                 score = score / np.sum(score)
                 sampled_ids = np.random.choice(len(score), sampled_number, p = score, replace = False) 
             sampled_keys = keys[sampled_ids]
@@ -242,28 +230,35 @@ def sample_subgraph(graph, time_range, sampled_depth = 2, sampled_number = 8, in
                 First adding the sampled nodes then updating budget.
             '''
             for k in sampled_keys:
-                layer_data[source_type][k] = len(layer_data[source_type])
+                layer_data[source_type][k] = [len(layer_data[source_type]), budget[source_type][k][1]]
             for k in sampled_keys:
-                source_id, source_time = decode(k)
-                add_budget(te, int(source_id), int(source_time), layer_data, budget)
-                budget[source_type].pop(k)    
+                add_budget(te, k, budget[source_type][k][1], layer_data, budget)
+                budget[source_type].pop(k)   
     '''
         Prepare feature, time and adjacency matrix for the sampled graph
     '''
     feature = {}
     times   = {}
     indxs   = {}
+    texts   = []
     for _type in layer_data:
-        idxs  = np.array([decode(key) for key in layer_data[_type]])
+        if len(layer_data[_type]) == 0:
+            continue
+        idxs  = np.array(list(layer_data[_type].keys()))
+        tims  = np.array(list(layer_data[_type].values()))[:,1]
+        
         if 'node_emb' in graph.node_feature[_type]:
-            feature[_type] = np.array(list(graph.node_feature['field'].loc[idxs[:,0], 'node_emb']), dtype=np.float)
+            feature[_type] = np.array(list(graph.node_feature[_type].loc[idxs, 'node_emb']), dtype=np.float)
         else:
             feature[_type] = np.zeros([len(idxs), 400])
-        feature[_type] = np.concatenate((feature[_type], list(graph.node_feature[_type].loc[idxs[:,0], 'emb']),\
-            np.log10(np.array(list(graph.node_feature[_type].loc[idxs[:,0], 'citation'])).reshape(-1, 1) + 0.01)), axis=1)
+        feature[_type] = np.concatenate((feature[_type], list(graph.node_feature[_type].loc[idxs, 'emb']),\
+            np.log10(np.array(list(graph.node_feature[_type].loc[idxs, 'citation'])).reshape(-1, 1) + 0.01)), axis=1)
         
-        times[_type]   = idxs[:,1]
-        indxs[_type]   = idxs[:,0]
+        times[_type]   = tims
+        indxs[_type]   = idxs
+        
+        if _type == 'paper':
+            texts = np.array(list(graph.node_feature[_type].loc[idxs, 'title']), dtype=np.str)
     edge_list = defaultdict( #target_type
                         lambda: defaultdict(  #source_type
                             lambda: defaultdict(  #relation_type
@@ -271,7 +266,7 @@ def sample_subgraph(graph, time_range, sampled_depth = 2, sampled_number = 8, in
                                     )))
     for _type in layer_data:
         for _key in layer_data[_type]:
-            _ser = layer_data[_type][_key]
+            _ser = layer_data[_type][_key][0]
             edge_list[_type][_type]['self'] += [[_ser, _ser]]
     '''
         Reconstruct sampled adjacancy matrix by checking whether each
@@ -284,16 +279,18 @@ def sample_subgraph(graph, time_range, sampled_depth = 2, sampled_number = 8, in
             for relation_type in tes:
                 tesr = tes[relation_type]
                 for target_key in layer_data[target_type]:
-                    target_ser = layer_data[target_type][target_key]
-                    tesrt = tesr[decode(target_key)[0]]
+                    target_ser = layer_data[target_type][target_key][0]
+                    if target_key not in tesr:
+                        continue
+                    tesrt = tesr[target_key]
                     for source_key in layer_data[source_type]:
-                        source_ser = layer_data[source_type][source_key]
+                        source_ser = layer_data[source_type][source_key][0]
                         '''
                             Check whether each link (target_id, source_id) exist in original adjacancy matrix
                         '''
-                        if decode(source_key)[0] in tesrt:
+                        if source_key in tesrt:
                             edge_list[target_type][source_type][relation_type] += [[target_ser, source_ser]]
-    return feature, times, edge_list, indxs
+    return feature, times, edge_list, indxs, texts
 
 def to_torch(feature, time, edge_list, graph):
     '''
@@ -311,28 +308,23 @@ def to_torch(feature, time, edge_list, graph):
     
     node_num = 0
     types = graph.get_types()
-    for t in graph.get_types():
-        type_id = len(node_dict)
-        node_dict[t] = [node_num, type_id]
+    for t in types:
+        node_dict[t] = [node_num, len(node_dict)]
         node_num     += len(feature[t])
-    if 'fake_paper' in feature:
-        node_dict['fake_paper'] = [node_num, node_dict['paper'][1]]
-        node_num     += len(feature['fake_paper'])
-        types += ['fake_paper']
     for t in types:
         node_feature += list(feature[t])
         node_time    += list(time[t])
-        type_id = node_dict[t][1]
-        node_type    += [type_id for _ in range(len(feature[t]))]
+        node_type    += [node_dict[t][1] for _ in range(len(feature[t]))]
         
     edge_dict = {e[2]: i for i, e in enumerate(graph.get_meta_graph())}
     edge_dict['self'] = len(edge_dict)
+    
     for target_type in edge_list:
         for source_type in edge_list[target_type]:
             for relation_type in edge_list[target_type][source_type]:
-                for ti, si in edge_list[target_type][source_type][relation_type]:
-                    sid, tid = si + node_dict[source_type][0], ti + node_dict[target_type][0]
-                    edge_index += [[sid, tid]]
+                for ii, (ti, si) in enumerate(edge_list[target_type][source_type][relation_type]):
+                    tid, sid = ti + node_dict[target_type][0], si + node_dict[source_type][0]
+                    edge_index += [[tid, sid]]
                     edge_type  += [edge_dict[relation_type]]   
                     '''
                         Our time ranges from 1900 - 2020, largest span is 120.
